@@ -1,16 +1,23 @@
-"""End-to-end check: run a real arithmetic circuit through all three Part 1 backends.
+"""End-to-end check: run a real, Classiq-synthesized arithmetic circuit
+through all three backends.
 
-Circuit under test: a 3-qubit ripple-carry adder (Qiskit's built-in
-`CDKMRippleCarryAdder`, kind="full") computing 3 + 5. Inputs are prepared
-with X gates; qubit layout (index 0 first) is:
+Circuit under test: the real output of `x |= 3; y |= 5; z |= x + y` (see
+classiq_model/arithmetic_example.py), synthesized once and committed as
+tests/resources/arithmetic.qasm - see the README's Notes section for why
+a committed fixture is used here instead of synthesizing on every test
+run. Classiq's compiler laid the 9 qubits out as x=q[0:2], y=q[2:5],
+z=q[5:9] (each register least-significant-qubit-first), and chose a
+QFT-based adder to implement `z |= x + y`, rather than a ripple-carry one.
 
-    cin[0], a[0..2], b[0..2], cout[0]
+Qiskit reads bitstrings with the highest qubit index first, so decoding
+the expected result "100010111" back into the three registers:
 
-The adder leaves `a` unchanged and sets `b := (a + b) mod 8`, `cout` := the
-carry bit. For a=3, b=5: 3 + 5 = 8 = 0b1000, so b ends at 0 and cout = 1.
-Qiskit's counts keys read qubit 7 (cout) first through qubit 0 (cin) last,
-giving a single fixed expected bitstring, "10000110", on every noise-free
-shot - confirmed empirically (see EXPECTED_BITSTRING below).
+    z = q[8..5] = 1000 = 8   (x + y)
+    y = q[4..2] = 101  = 5
+    x = q[1..0] = 11   = 3
+
+confirmed empirically as the single outcome on every noise-free shot (see
+EXPECTED_BITSTRING below).
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ from backend.runners import (
 )
 
 QASM_PATH = Path(__file__).parent / "resources" / "arithmetic.qasm"
-EXPECTED_BITSTRING = "10000110"  # cout=1, b=000, a=011, cin=0  ->  3 + 5 = 8
+EXPECTED_BITSTRING = "100010111"  # z=1000(8), y=101(5), x=11(3)  ->  3 + 5 = 8
 NUM_SHOTS = 2000
 
 
@@ -76,10 +83,11 @@ def test_noisy_statevector_backend_mostly_succeeds(qasm):
     backend = SimBackend("statevector_noisy", NoisyStateVectorSimulatorRunner())
     counts = _run_on_backend(backend, qasm)
 
-    # Depolarizing noise on ~10 two-qubit gates degrades the success rate,
-    # but the correct answer must still be the dominant outcome. The
-    # threshold is well below the ~0.65-0.70 typically observed, to leave
-    # comfortable margin against run-to-run sampling noise.
+    # Depolarizing noise on ~40 two-qubit gates (this circuit is
+    # transpiled down onto cx/u1/u2/u3/x for the noisy simulators) degrades
+    # the success rate, but the correct answer must still be the dominant
+    # outcome. The threshold is well below the ~0.70-0.75 typically
+    # observed, to leave comfortable margin against sampling noise.
     assert _success_rate(counts, EXPECTED_BITSTRING) > 0.4
     assert counts[EXPECTED_BITSTRING] == max(counts.values())
 

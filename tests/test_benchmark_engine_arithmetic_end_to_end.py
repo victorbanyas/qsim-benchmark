@@ -1,20 +1,16 @@
-"""End-to-end check: run the Part 1 arithmetic circuit through BenchmarkEngine
-with all three real simulator backends.
+"""End-to-end check: run the real, Classiq-synthesized arithmetic circuit
+through BenchmarkEngine with all three real simulator backends.
 
-Same circuit as tests/test_arithmetic_end_to_end.py (the 3-qubit ripple-carry
-adder computing 3 + 5, expected bitstring "10000110") and the same caveat:
-it's a stand-in for the real Classiq-synthesized "x |= 3; y |= 5; z |= x + y"
-model (see classiq_model/arithmetic_example.py), because synthesizing
-requires live, authenticated access to Classiq's cloud API that isn't
-available in this sandbox.
-
-Here that means standing in for the *Synthesizer* rather than calling
-SimBackend directly: `_FixtureSynthesizer` returns the already-known QASM
-for any qmod it's asked to synthesize, letting BenchmarkEngine's own
-synthesize -> fan out -> score pipeline run for real against real Aer
-simulators. Everything downstream of "what does synthesize(qmod) return" -
-SimBackend, the three SimulatorRunners, scoring - is exercised exactly as
-it would be with a real Synthesizer.
+Same circuit as tests/test_arithmetic_end_to_end.py - see that module's
+docstring for how "100010111" decodes back to x=3, y=5, z=8. See the
+README's Notes section for why this test uses the committed QASM fixture
+rather than a live Synthesizer: `_FixtureSynthesizer` returns the
+already-known QASM for any qmod it's asked to synthesize, standing in for
+*only* the Synthesizer, so BenchmarkEngine's own synthesize -> fan out ->
+score pipeline runs for real against real Aer simulators. Everything
+downstream of "what does synthesize(qmod) return" - SimBackend, the three
+SimulatorRunners, scoring - is exercised exactly as it would be with
+ClassiqSynthesizer in place of the fixture.
 """
 
 from __future__ import annotations
@@ -34,7 +30,7 @@ from backend.runners import (
 from backend.dal import InMemoryStore
 
 QASM_PATH = Path(__file__).parent / "resources" / "arithmetic.qasm"
-EXPECTED_BITSTRING = "10000110"  # cout=1, b=000, a=011, cin=0  ->  3 + 5 = 8
+EXPECTED_BITSTRING = "100010111"  # z=1000(8), y=101(5), x=11(3)  ->  3 + 5 = 8
 NUM_SHOTS = 2000
 
 

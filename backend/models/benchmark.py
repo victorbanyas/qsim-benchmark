@@ -31,7 +31,7 @@ class Benchmark:
 
     id: str
     qmod: str
-    expected_result: str  # the expected measurement bitstring, e.g. "10000110"
+    expected_result: str  # the expected measurement bitstring, e.g. "100010111"
     num_shots: int
     backend_names: List[str]
     synthesis_status: JobStatus = JobStatus.QUEUED

@@ -24,8 +24,13 @@ SimBackend / SimulatorRunner pipeline this file's output will run through.
 import sys
 from pathlib import Path
 
+import keyring
+from keyrings.alt.file import PlaintextKeyring
+
 from classiq import Output, QNum, TargetLanguage, export, synthesize, authenticate
 from classiq.qmod import qfunc
+
+keyring.set_keyring(PlaintextKeyring())
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QASM_OUT_PATH = REPO_ROOT / "tests" / "resources" / "arithmetic.qasm"
@@ -67,5 +72,5 @@ def synthesize_arithmetic_model() -> None:
 
 
 if __name__ == "__main__":
-    #authenticate()
+    authenticate(overwrite=True)  # only needed if you haven't already authenticated
     synthesize_arithmetic_model()

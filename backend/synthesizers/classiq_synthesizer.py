@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import keyring
+from keyrings.alt.file import PlaintextKeyring
+
 from classiq import TargetLanguage, export, synthesize
 from classiq.synthesis import SerializedModel
+
+keyring.set_keyring(PlaintextKeyring())
 
 
 class ClassiqSynthesizer:

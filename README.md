@@ -1,7 +1,7 @@
 # qsim-benchmark
 
 A benchmarking application for quantum hardware: a simulated multi-backend job
-system (Part 1) plus a benchmarking engine on top of it (Part 2).
+system and a benchmarking engine on top of it.
 
 ## Setup & running
 
@@ -271,9 +271,16 @@ wiring a shared store correctly end to end.
 
 ### 4.2 Arithmetic test
 
-Both remaining test files run a real circuit through real simulators: a
-3-qubit ripple-carry adder computing `3 + 5`, with expected measurement
-bitstring `"10000110"` (`cout=1, b=000, a=011, cin=0`).
+Both remaining test files run a real, Classiq-synthesized circuit through
+real simulators: the compiled output of `x |= 3; y |= 5; z |= x + y`
+(`classiq_model/arithmetic_example.py`), committed as
+`tests/resources/arithmetic.qasm`. Classiq's compiler laid the 9 qubits out
+as `x = q[0:2]`, `y = q[2:5]`, `z = q[5:9]` (each register
+least-significant-qubit-first) and implemented the addition with a
+QFT-based adder rather than a ripple-carry one. Reading Qiskit's bitstrings
+highest-qubit-first, the expected measurement `"100010111"` decodes as
+`z = 1000` (8), `y = 101` (5), `x = 11` (3) — confirmed empirically as the
+single outcome on every noise-free shot.
 
 - **`tests/test_arithmetic_end_to_end.py`** runs it directly through each of
   the three real `SimBackend`s.
@@ -283,21 +290,25 @@ bitstring `"10000110"` (`cout=1, b=000, a=011, cin=0`).
 
 #### 4.2.1 Why the results make sense
 
-- **Noiseless state vector**: every shot lands exactly on `"10000110"` —
+- **Noiseless state vector**: every shot lands exactly on `"100010111"` —
   `counts == {EXPECTED_BITSTRING: NUM_SHOTS}`, a benchmark score of `1.0`.
   The circuit is fully deterministic (no superposition) and there's no
   noise source, so there's nothing that could produce any other outcome.
 - **Noisy state vector (depolarizing)**: success rate is empirically around
-  0.65–0.70; the tests assert `> 0.4` with margin for run-to-run sampling
+  0.70–0.73; the tests assert `> 0.4` with margin for run-to-run sampling
   noise, and additionally assert the correct bitstring is still the most
-  common outcome. This is the expected qualitative shape for depolarizing
-  noise: with roughly ten two-qubit gates in the adder and a 1% per-gate
-  two-qubit error rate, there's a meaningful chance across the whole circuit
-  that some bit gets flipped, but the error rate is low enough that the
-  correct outcome remains dominant rather than getting washed out into a
-  uniform distribution.
+  common outcome. Transpiled onto the noisy simulator's basis gates, this
+  circuit comes out to roughly 40 two-qubit gates and 60 single-qubit gates
+  — more than an order of magnitude more gates than a hand-written
+  ripple-carry adder for the same numbers would need, since a QFT-based
+  adder trades gate count for avoiding the ripple-carry's linear-depth
+  carry chain. Even so, at a 1% two-qubit / 0.1% single-qubit error rate,
+  the chance of *some* gate erroring across the whole circuit is
+  meaningful, but the correct outcome still stays dominant rather than
+  getting washed out into a uniform distribution over the 2⁹ possible
+  bitstrings.
 - **Noisy density matrix (thermal relaxation)**: success rate is similarly
-  around 0.65–0.72, same `> 0.4` threshold. The mechanism is different —
+  around 0.73–0.77, same `> 0.4` threshold. The mechanism is different —
   decay accumulates with how long each gate takes relative to T1/T2, and
   two-qubit gates take 6x longer than single-qubit ones here — but the
   qualitative result is the same: noise measurably erodes fidelity without
@@ -313,23 +324,46 @@ bitstring `"10000110"` (`cout=1, b=000, a=011, cin=0`).
 
 ## 5. Notes
 
-**On using a Qiskit-produced circuit instead of a Classiq-synthesized
-one.** The intended flow was to define the arithmetic model in Classiq
-(`x |= 3; y |= 5; z |= x + y`, committed in
-`classiq_model/arithmetic_example.py`), synthesize it, and export the
-resulting OpenQASM. I ran into trouble getting Classiq's authentication and
-synthesis to complete reliably end-to-end in the time available, so to keep
-the rest of the system moving I substituted a Qiskit-built circuit with the
-same shape — a 3-qubit ripple-carry adder computing `3 + 5` — as the
-committed test fixture (`tests/resources/arithmetic.qasm`). It exercises
-the exact same `SimBackend` / `SimulatorRunner` / `BenchmarkEngine`
-pipeline that the real Classiq-synthesized QASM would run through, so
-nothing downstream of "where does the QASM come from" is a stand-in.
-Swapping in the real thing only requires re-running
-`classiq_model/arithmetic_example.py` with valid Classiq credentials to
-regenerate the fixture, and double-checking `EXPECTED_BITSTRING`, since
-Classiq's compiler and Qiskit's may not lay out qubits/bits in the same
-order. One related detail worth calling out: `ClassiqSynthesizer` exports
-explicitly via `TargetLanguage.QASM2`, since Classiq defaults to OpenQASM 3
-but Qiskit's `qasm2.loads` (used by every `SimulatorRunner`) expects
-OpenQASM 2.
+**Why the test suite runs against a committed QASM fixture instead of
+calling Classiq during test runs.** `classiq_model/arithmetic_example.py`
+is the real Classiq model (`x |= 3; y |= 5; z |= x + y`); running it (with
+valid Classiq credentials) synthesizes it for real and writes the result to
+`tests/resources/arithmetic.qasm`, which is what's committed and what the
+arithmetic tests actually run against. What the tests deliberately don't
+do is call Classiq live on every run - that's on purpose, not a workaround.
+
+`BenchmarkEngine` and `SimBackend` only ever depend on the
+`Synthesizer`/`SimulatorRunner` protocols, never on Classiq or Qiskit
+specifics directly - that separation is the whole point of those
+interfaces. Testing the actual logic (queueing, status transitions,
+retries, scoring, fan-out) shouldn't require live Classiq authentication,
+network access, or the platform being up; those are `ClassiqSynthesizer`'s
+concern (`backend/synthesizers/classiq_synthesizer.py`), a thin adapter
+that any real usage of this system would inject exactly the way the tests
+inject `_FixtureSynthesizer` instead. Committing the fixture keeps the
+arithmetic tests fast, deterministic, and runnable offline, while still
+exercising the *real* output of Classiq's compiler rather than a hand-built
+stand-in: `EXPECTED_BITSTRING = "100010111"` is exactly what
+`synthesize_arithmetic_model()` produced from the real model, not guessed
+or adjusted to make a test pass. Regenerating it, if Classiq's compiler
+output ever changes, is just re-running that script with valid credentials
+and re-committing the file.
+
+Two integration details worth calling out, both fixed generically in
+`backend/runners/base.py` rather than special-cased for this one fixture,
+since they apply to any real Classiq-synthesized QASM:
+
+- Classiq's OpenQASM 2 export uses IBM's extended gate-naming convention
+  (e.g. `cp` for controlled-phase) that Qiskit's strict-by-default
+  `qasm2.loads()` doesn't recognize from `include "qelib1.inc"` alone -
+  fixed by passing Qiskit's own `LEGACY_CUSTOM_INSTRUCTIONS` /
+  `LEGACY_CUSTOM_CLASSICAL` compatibility sets into `qasm2.loads()`.
+- Classiq exports the bare arithmetic unitary with no measurement
+  operations - measurement is left to the caller rather than baked into
+  the circuit. `AerSimulatorRunner.run()` now calls `circuit.measure_all()`
+  itself whenever the parsed circuit has no classical bits of its own, so
+  it works whether or not the source QASM measures itself.
+
+One more: `ClassiqSynthesizer` exports explicitly via
+`TargetLanguage.QASM2`, since Classiq defaults to OpenQASM 3 but Qiskit's
+`qasm2.loads` (used by every `SimulatorRunner`) expects OpenQASM 2.
