@@ -1,0 +1,335 @@
+# qsim-benchmark
+
+A benchmarking application for quantum hardware: a simulated multi-backend job
+system (Part 1) plus a benchmarking engine on top of it (Part 2).
+
+## Setup & running
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+pip install -r requirements.txt
+python -m pytest
+```
+
+Run it as `python -m pytest` rather than bare `pytest` — `-m` guarantees the
+repo root is importable (so `from backend...` resolves) and doesn't depend
+on the `pytest` console script itself being on your PATH, which is a common
+source of a "command not found" error even right after `pip install`.
+(`pyproject.toml` also sets `pythonpath`, so a bare `pytest` will resolve
+imports correctly too if it's on your PATH.)
+
+No Classiq credentials are needed to run the test suite — the arithmetic
+tests use an already-committed QASM fixture (see Notes, below). Only
+`classiq_model/arithmetic_example.py`, which regenerates that fixture from a
+real Classiq model, needs Classiq installed and authenticated.
+
+## 1. Purpose of the system
+
+The assignment is to build a benchmarking application for quantum hardware,
+in two layers.
+
+**Part 1** is a job system that mimics a cloud quantum hardware provider: you
+submit a QASM circuit and a shot count, and get back a job id you can poll
+for status and, once finished, a measurement-counts histogram. Three
+backends are required, each simulating a different kind of hardware: an
+ideal (noiseless) simulator, a noisy simulator, and a differently-noisy
+simulator that needs a different simulation method.
+
+**Part 2** is a benchmarking engine built on top of Part 1: given a quantum
+model, an expected outcome, a shot count, and a list of backends, it
+synthesizes the model into QASM once, runs it on every requested backend,
+and scores each backend by the percentage of shots whose measured outcome
+matched the expected result. It has to synthesize once and execute many
+times, survive a single backend failing without blocking the others (with a
+way to retry just that backend), expose real progress rather than a single
+"running" flag, and support several benchmarks running at once.
+
+## 2. The three simulators
+
+All three are built on Qiskit's `AerSimulator` and live under
+`backend/runners/` (one file per runner, plus `base.py` for the shared
+execution path — parse QASM, transpile, run, collect counts — and
+`runner.py` for the `SimulatorRunner` interface itself) — they differ only
+in how the `AerSimulator` itself is configured.
+
+- **`StateVectorSimulatorRunner`** — `AerSimulator(method="statevector")`,
+  no noise model at all. A state vector is the circuit's exact quantum
+  state; with nothing perturbing it, this is the ideal, noiseless baseline —
+  every shot should reproduce the arithmetically correct outcome.
+
+- **`NoisyStateVectorSimulatorRunner`** — same state-vector method, with a
+  `NoiseModel` applying `depolarizing_error` per gate (0.1% on single-qubit
+  gates, 1% on two-qubit gates): after each gate, there's a small
+  probability the qubit gets randomized instead of doing what the gate
+  intended. It's a memoryless, per-gate error — it only cares that a gate
+  happened, not how long it took — so Aer can simulate it by sampling a
+  stochastic Kraus channel per shot (i.e. randomly rolling, per shot,
+  whether the error fires) while staying in the pure-state formalism.
+  That's what keeps it compatible with state-vector simulation rather than
+  requiring density-matrix.
+
+- **`NoisyDensityMatrixSimulatorRunner`** — `AerSimulator(method="density_matrix")`,
+  with a `NoiseModel` applying `thermal_relaxation_error` (T1 = 50,000ns,
+  T2 = 70,000ns, gate durations of 50ns for single-qubit gates and 300ns for
+  two-qubit gates). A density matrix generalizes the state vector to also
+  represent mixed states (statistical uncertainty about which pure state
+  you're in, not just quantum superposition). Thermal relaxation is a
+  genuinely different, time-dependent noise mechanism — decay accumulates
+  with how long a gate takes, not just with the gate count — and it can
+  leave a qubit in exactly such a mixed state. That mixedness is what the
+  state-vector method can't represent, which is why this backend needs the
+  density-matrix method — satisfying
+  the requirement that the two noisy backends use two different noise types
+  and, correspondingly, two different simulation methods.
+
+## 3. Design & Architecture
+
+### 3.1 The vision of the complete distributed system
+
+A production version of this system would look like a small set of
+cooperating services around one persistent datastore:
+
+- A **jobs table** and a **benchmarks table** in a real database (e.g.
+  Postgres), holding the same fields as the `Job` and `Benchmark` records
+  described below.
+- One **message broker** (e.g. Kafka) with one topic per backend, plus a
+  topic for new benchmarks. `submit_job` and `benchmark` would be pure
+  producers: write the initial record to the DB, publish a message, return
+  immediately.
+- Each simulated backend as its **own worker service** (or pool of workers
+  in a consumer group) consuming its topic, executing one job at a time (or
+  in parallel across workers), and writing every status transition straight
+  back to the jobs table.
+- The **benchmarking engine** as another service: it consumes the
+  benchmarks topic, synthesizes once, and fans out by publishing one message
+  per backend onto each backend's own topic — it never talks to a backend
+  service directly, only through the shared table and the queues.
+- **Durability** falls out of this for free: because state lives in the DB
+  and work lives in durably-committed queue offsets, a crashed or restarted
+  worker just resumes — in-flight jobs are still sitting in the table
+  (or still un-acked on the queue) rather than lost in some process's
+  memory.
+- **Multiple concurrent benchmarks** are naturally supported, since nothing
+  above is keyed by "the one benchmark currently running" — every record and
+  every queue message carries its own id.
+
+### 3.2 The actual implementation
+
+None of the above is actually stood up — there's no real Postgres or Kafka
+here — but the code is written against two small generic interfaces so that
+swapping in real ones wouldn't touch `SimBackend` or `BenchmarkEngine` at
+all:
+
+- **`backend/dal/store.py`** defines the `Store[T]` protocol
+  (`get`/`put`/`update`), implemented by `in_memory_store.py`'s
+  `InMemoryStore` (a dict behind a lock; every read/write goes through
+  `copy.deepcopy`, so a caller can never mutate a "persisted" value by
+  holding onto a reference) and `sqlite_store.py`'s `SqliteStore` (the same
+  protocol backed by a local SQLite file via `sqlite3` + `pickle`, so
+  records actually survive a process restart without a real database
+  server). `update()` is the atomic read-modify-write primitive in both.
+  Which one a `SimBackend`/`BenchmarkEngine` uses is just a constructor
+  argument — see `build_system()` below.
+- **`backend/dal/queue.py`** defines the `Queue[T]` protocol
+  (`publish`/`consume`/`close`) and `InMemoryQueue`, wrapping
+  `queue.Queue`. `close()`/`consume()` implement a *broadcast* shutdown:
+  the consumer that reads the shutdown sentinel puts it back before
+  returning, so every consumer behind it — not just the first one to wake
+  up — also sees it and stops. That matters once there's more than one
+  worker reading the same queue (see `BenchmarkEngine`, next).
+- Both `SimBackend` and `BenchmarkEngine` take their `Store`/`Queue`
+  instances as constructor arguments, defaulting to private in-memory ones
+  so each still works standalone in isolation (as in most of the tests). To
+  get the "shared jobs table" behavior described above, one `Store[Job]` is
+  constructed once and passed to every `SimBackend` *and* to
+  `BenchmarkEngine`. Because `BenchmarkEngine` reads a `Job`'s status
+  straight out of that same store — the identical record each backend's
+  worker already flushed its status into — there's no `_refresh` step, no
+  polling, and no RPC back into a `SimBackend` to ask "are you done yet."
+  `BenchmarkEngine` also takes a `num_workers` argument (default `1`): that
+  many threads pull from the same benchmark queue and run the (slow,
+  blocking) synthesis step concurrently, so several benchmarks submitted
+  around the same time don't queue up behind one another's synthesis call.
+  This needed no change to how a benchmark is processed — `queue.Queue`
+  already hands each queued id to exactly one consumer, and every state
+  change already goes through `Store.update()`'s lock — the only real
+  change was the broadcast-shutdown fix above, so `stop()` can still join
+  every worker in the pool instead of hanging on all but one of them.
+- `SimulatorRunner` (`backend/runners/runner.py`) and `Synthesizer`
+  (`backend/synthesizers/synthesizer.py`) are kept as their own small
+  `Protocol`s, each split from its implementation(s) the same way — a
+  concrete runner is picked with `backend/runners/state_vector.py` etc.,
+  and the real, Classiq-backed synthesizer lives in
+  `backend/synthesizers/classiq_synthesizer.py` — so `SimBackend` and
+  `BenchmarkEngine` are testable with fakes that never touch Qiskit or
+  Classiq (see Testing, below).
+- **`backend/system.py`** adds `build_system()`: a small factory that
+  builds the three standard backends and a `BenchmarkEngine` together,
+  sharing one `Store[Job]`, instead of leaving that wiring to be done by
+  hand at every call site. `BenchmarkEngine`'s constructor already refuses
+  to default that store — passing a mismatched one wouldn't raise
+  anything, every status/result read would just look like "job not found,"
+  which is a much worse failure mode than a loud error. `build_system()`
+  goes one step further than just failing loudly on a mismatch: it removes
+  the chance of a mismatch happening at all. It's also where a `SqliteStore`
+  would get plugged in for a durable system (`build_system(job_store=SqliteStore("jobs.db"))`).
+
+  That one shared `Store[Job]` is the standard *shared-database*
+  integration pattern — it's exactly what lets `BenchmarkEngine` read a
+  job's status without polling or calling back into `SimBackend`. It's
+  worth naming the pattern's usual cost, too: in a strict
+  "each service owns its own data" design, a table more than one component
+  reads directly is considered coupling — `BenchmarkEngine` now depends on
+  `Job`'s shape, which conceptually belongs to `SimBackend`, so the two
+  can't change that record independently without coordinating. That
+  tradeoff is acceptable here specifically because `SimBackend` and
+  `BenchmarkEngine` aren't independently-deployed services with their own
+  release cycles — they're two layers of one system, and `Job` is a
+  stable, intentionally shared contract between them, not either side's
+  private internal state being reached into.
+
+### 3.3 Models
+
+- **`Job`** (`backend/models/job.py`) — one Part 1 job, and the actual row
+  in the shared "jobs table": `id`, `qasm`, `num_shots`, `backend_name`,
+  `status` (`QUEUED` / `RUNNING` / `DONE` / `ERROR`), `counts`, `error`, and
+  three timestamps. A `SimBackend`'s worker writes every transition here
+  directly.
+- **`Benchmark`** (`backend/models/benchmark.py`) — one benchmark run: the
+  submitted `qmod`, `expected_result`, `num_shots`, the list of requested
+  `backend_names`, the synthesis outcome (`synthesis_status`, `qasm` once
+  produced, `synthesis_error` if it failed), and one `BackendRun` per
+  requested backend.
+- **`BackendRun`** — deliberately minimal: just `job_id` and
+  `submit_error` (set only if `submit_job()` itself raised before a job
+  ever existed). It doesn't cache status, counts, or a score — those are
+  always read fresh from the `Job` in the shared store, so there's nothing
+  that can go stale. It also doesn't repeat the backend's name, since that's
+  already the dict key in `Benchmark.backend_runs`.
+- **`BenchmarkStatus`** — what `get_benchmark_status()` returns:
+  `synthesis_status` plus a `{backend_name: JobStatus}` map, with
+  `completed` / `total` / `is_finished` as computed properties. This is the
+  observable-progress piece the assignment calls for — a caller can see
+  "2 of 3 backends done" rather than a single opaque "running" flag.
+
+### 3.4 Known tradeoffs and things deliberately left out
+
+A few things were considered and intentionally not built, either because
+they'd add complexity this exercise doesn't need, or because they depend
+on something not verifiable without more time. Worth naming explicitly
+rather than leaving implicit:
+
+- **No worker pool per backend.** Each `SimBackend` still runs jobs on a
+  single worker thread, one job at a time, even though `BenchmarkEngine`'s
+  synthesis step now supports a pool (above). This is deliberate: a
+  backend is dedicated to one `SimulatorRunner` instance, and the design is
+  meant to stay generic across whatever `SimulatorRunner` is plugged in —
+  there's no guarantee a given simulator (e.g. a shared `AerSimulator`
+  instance) tolerates concurrent `.run()` calls from multiple threads
+  without checking first. It also happens to be a reasonably faithful
+  model of real quantum hardware: a physical QPU is one device that runs
+  one circuit at a time, which is why real providers show you a queue
+  position rather than running jobs in parallel. If throughput ever needed
+  to scale, the intended lever is horizontal, not multi-threading a single
+  backend: run multiple `SimBackend` instances — each with its own
+  `SimulatorRunner` instance — behind the same job store, the same way
+  multiple physical QPUs would sit behind one job queue.
+- **No per-job timeouts.** A worker stuck inside `SimulatorRunner.run()`
+  would currently block that backend's queue indefinitely. Python can't
+  safely, preemptively cancel a running thread, so a timeout can only stop
+  *waiting* for the call (e.g. `concurrent.futures.Future.result(timeout=...)`),
+  not stop the call itself — the abandoned computation keeps running in
+  the background on its own thread until it finishes on its own, freeing
+  up the job queue but not the CPU it's still using. Actually reclaiming
+  that resource would mean running the simulation in a separate process
+  instead of a thread, so it could be forcibly terminated — at the cost of
+  the IPC overhead of shipping the QASM in and the result back out across
+  a process boundary.
+- **No per-key locking in `InMemoryStore`/`SqliteStore`.** Both guard every
+  operation with a single lock covering the whole store, so a write to one
+  job serializes against reads/writes to every other job, even though
+  they're logically unrelated. That's a real throughput ceiling under
+  contention that a real database wouldn't have (row-level locking, or
+  optimistic concurrency), but at this scale it isn't worth the added
+  complexity of sharding locks per key.
+
+## 4. Testing
+
+### 4.1 Sanity tests
+
+`tests/test_sim_backend.py` (6 tests) and `tests/test_benchmark_engine.py`
+(9 tests, including the synthesis worker pool) exercise the queueing,
+concurrency, error-handling, retry, and not-found paths of `SimBackend` and
+`BenchmarkEngine` using fake `SimulatorRunner`/`Synthesizer` test doubles,
+so they run fast and don't touch Qiskit, Classiq, or any network.
+`tests/test_storage.py` (5 tests) does the same for `SqliteStore`,
+including the actual durability claim: writing through one instance,
+closing it, and confirming a brand new instance pointed at the same file
+sees the same data. `tests/test_system.py` (3 tests) covers `build_system()`
+wiring a shared store correctly end to end.
+
+### 4.2 Arithmetic test
+
+Both remaining test files run a real circuit through real simulators: a
+3-qubit ripple-carry adder computing `3 + 5`, with expected measurement
+bitstring `"10000110"` (`cout=1, b=000, a=011, cin=0`).
+
+- **`tests/test_arithmetic_end_to_end.py`** runs it directly through each of
+  the three real `SimBackend`s.
+- **`tests/test_benchmark_engine_arithmetic_end_to_end.py`** runs the same
+  circuit through `BenchmarkEngine`, fanning out to all three backends from
+  a single `benchmark()` call, and checks both status reporting and scores.
+
+#### 4.2.1 Why the results make sense
+
+- **Noiseless state vector**: every shot lands exactly on `"10000110"` —
+  `counts == {EXPECTED_BITSTRING: NUM_SHOTS}`, a benchmark score of `1.0`.
+  The circuit is fully deterministic (no superposition) and there's no
+  noise source, so there's nothing that could produce any other outcome.
+- **Noisy state vector (depolarizing)**: success rate is empirically around
+  0.65–0.70; the tests assert `> 0.4` with margin for run-to-run sampling
+  noise, and additionally assert the correct bitstring is still the most
+  common outcome. This is the expected qualitative shape for depolarizing
+  noise: with roughly ten two-qubit gates in the adder and a 1% per-gate
+  two-qubit error rate, there's a meaningful chance across the whole circuit
+  that some bit gets flipped, but the error rate is low enough that the
+  correct outcome remains dominant rather than getting washed out into a
+  uniform distribution.
+- **Noisy density matrix (thermal relaxation)**: success rate is similarly
+  around 0.65–0.72, same `> 0.4` threshold. The mechanism is different —
+  decay accumulates with how long each gate takes relative to T1/T2, and
+  two-qubit gates take 6x longer than single-qubit ones here — but the
+  qualitative result is the same: noise measurably erodes fidelity without
+  destroying the signal.
+- **Both noisy backends score below the noiseless one**, confirmed directly
+  by `test_noise_measurably_degrades_success_rate`, which is the sanity
+  check that the noise models are actually doing something rather than
+  being silently ignored.
+- The `BenchmarkEngine`-level results match the backend-level rates, since
+  both use the identical scoring formula (`counts[expected] / total`) and
+  the identical committed circuit — the benchmark engine is really just
+  orchestrating the same three backend runs plus one synthesis step.
+
+## 5. Notes
+
+**On using a Qiskit-produced circuit instead of a Classiq-synthesized
+one.** The intended flow was to define the arithmetic model in Classiq
+(`x |= 3; y |= 5; z |= x + y`, committed in
+`classiq_model/arithmetic_example.py`), synthesize it, and export the
+resulting OpenQASM. I ran into trouble getting Classiq's authentication and
+synthesis to complete reliably end-to-end in the time available, so to keep
+the rest of the system moving I substituted a Qiskit-built circuit with the
+same shape — a 3-qubit ripple-carry adder computing `3 + 5` — as the
+committed test fixture (`tests/resources/arithmetic.qasm`). It exercises
+the exact same `SimBackend` / `SimulatorRunner` / `BenchmarkEngine`
+pipeline that the real Classiq-synthesized QASM would run through, so
+nothing downstream of "where does the QASM come from" is a stand-in.
+Swapping in the real thing only requires re-running
+`classiq_model/arithmetic_example.py` with valid Classiq credentials to
+regenerate the fixture, and double-checking `EXPECTED_BITSTRING`, since
+Classiq's compiler and Qiskit's may not lay out qubits/bits in the same
+order. One related detail worth calling out: `ClassiqSynthesizer` exports
+explicitly via `TargetLanguage.QASM2`, since Classiq defaults to OpenQASM 3
+but Qiskit's `qasm2.loads` (used by every `SimulatorRunner`) expects
+OpenQASM 2.

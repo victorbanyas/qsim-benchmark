@@ -1,16 +1,13 @@
-"""Generic async job machinery for a single simulated quantum hardware backend.
+"""SimBackend: an async, queued job system in front of a SimulatorRunner -
+mimics one cloud hardware provider's job API.
 
-A `SimBackend` mimics one cloud hardware provider's job API: `submit_job`
-puts work on a queue, a background worker thread drains the queue and
-executes jobs one at a time, and `get_status` / `get_result` let a caller
-poll for progress and pull the final counts once a job is done.
-
-This class knows nothing about *how* a circuit is actually executed - that
-is the job of the `SimulatorRunner` passed into the constructor. Three
-`SimBackend` instances, each wrapping a different `SimulatorRunner`
-(state vector, noisy state vector, noisy density matrix), give you the
-three backends required by Part 1 without duplicating any of the
-queue / thread / status bookkeeping: that machinery lives here, once.
+submit_job() queues work; a background worker thread drains the queue and
+executes jobs one at a time; get_status()/get_result() let a caller poll
+for progress and pull counts once a job is done. Execution itself is
+delegated to a SimulatorRunner. Job records and queueing go through an
+injected Store[Job]/Queue[str] (see backend/dal), so a caller
+sharing the same Store can read a Job's status directly instead of
+polling this class - which is what BenchmarkEngine does.
 """
 
 from __future__ import annotations
@@ -18,81 +15,40 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, Optional, Protocol
-from queue import Queue
+from dataclasses import replace
+from typing import Dict, Optional
 
+from backend.dal import InMemoryQueue, InMemoryStore, Queue, Store
+from backend.errors import JobNotFoundError, JobNotReadyError
+from backend.models import Job, JobStatus
+from backend.runners import SimulatorRunner
 
-class JobStatus(str, Enum):
-    QUEUED = "QUEUED"
-    RUNNING = "RUNNING"
-    DONE = "DONE"
-    ERROR = "ERROR"
-
-
-class JobNotFoundError(KeyError):
-    """Raised when a job id was never submitted to this backend."""
-
-
-class JobNotReadyError(RuntimeError):
-    """Raised by get_result() when the job hasn't finished (or failed) yet."""
-
-
-class SimulatorRunner(Protocol):
-    """Strategy interface: knows how to execute one circuit and return counts.
-
-    Each of the three Part 1 configurations (plain state vector, noisy
-    state vector, noisy density matrix) is a separate implementation of
-    this protocol, e.g. wrapping a differently-configured AerSimulator.
-    SimBackend is deliberately ignorant of Qiskit/Aer specifics - it only
-    ever calls `run(qasm, num_shots)` and expects a counts dict back.
-    """
-
-    def run(self, qasm: str, num_shots: int) -> Dict[str, int]:
-        """Execute `qasm` for `num_shots` shots.
-
-        Returns a histogram over measured bitstrings, e.g.
-        {"00": 512, "11": 488}.
-        """
-        ...
-
-
-@dataclass
-class Job:
-    id: str
-    qasm: str
-    num_shots: int
-    status: JobStatus = JobStatus.QUEUED
-    counts: Optional[Dict[str, int]] = None
-    error: Optional[str] = None
-    submitted_at: float = field(default_factory=time.time)
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
-
-
-# Sentinel pushed onto the queue to tell the worker thread to stop cleanly,
-# without needing a poison-pill string that could collide with a real job id.
-_SHUTDOWN = "SHUTDOWN"
+__all__ = [
+    "JobNotFoundError",
+    "JobNotReadyError",
+    "SimBackend",
+]
 
 
 class SimBackend:
-    """One simulated backend: an async, queued job system in front of a SimulatorRunner.
-
-    Mirrors how a real cloud provider exposes one specific QPU: you submit
-    a job to *this* backend, it queues behind whatever else is running
-    here, and a single worker thread processes jobs one at a time -
-    independent of any other SimBackend instance. That independence is
-    what lets one backend fail or lag in Part 2's benchmark without
-    affecting the others.
+    """One simulated backend: jobs submitted here queue behind whatever
+    else is running, processed one at a time by a single worker thread,
+    independent of any other SimBackend instance.
     """
 
-    def __init__(self, name: str, runner: SimulatorRunner):
+    def __init__(
+        self,
+        name: str,
+        runner: SimulatorRunner,
+        job_store: Optional[Store[Job]] = None,
+        job_queue: Optional[Queue[str]] = None,
+    ):
         self.name = name
         self._runner = runner
-        self._queue: Queue[str] = Queue()
-        self._jobs: Dict[str, Job] = {}
-        self._lock = threading.Lock()
+        # Defaults to private in-memory instances; pass a store shared
+        # with other SimBackends/BenchmarkEngine to read Jobs across them.
+        self._store: Store[Job] = job_store or InMemoryStore()
+        self._queue: Queue[str] = job_queue or InMemoryQueue()
         self._worker: Optional[threading.Thread] = None
 
     # -- lifecycle -----------------------------------------------------
@@ -110,7 +66,7 @@ class SimBackend:
         """Ask the worker to finish its current job and stop, then join it."""
         if self._worker is None:
             return
-        self._queue.put(_SHUTDOWN)
+        self._queue.close()
         self._worker.join(timeout=timeout)
         self._worker = None
 
@@ -119,10 +75,9 @@ class SimBackend:
     def submit_job(self, qasm: str, num_shots: int) -> str:
         """Queue a job and return its id immediately (does not block on execution)."""
         job_id = str(uuid.uuid4())
-        job = Job(id=job_id, qasm=qasm, num_shots=num_shots)
-        with self._lock:
-            self._jobs[job_id] = job
-        self._queue.put(job_id)
+        job = Job(id=job_id, qasm=qasm, num_shots=num_shots, backend_name=self.name)
+        self._store.put(job_id, job)
+        self._queue.publish(job_id)
         return job_id
 
     def get_status(self, job_id: str) -> JobStatus:
@@ -148,35 +103,36 @@ class SimBackend:
     # -- internals -------------------------------------------------------
 
     def _get_job(self, job_id: str) -> Job:
-        with self._lock:
-            job = self._jobs.get(job_id)
+        job = self._store.get(job_id)
         if job is None:
             raise JobNotFoundError(f"unknown job id: {job_id}")
         return job
 
     def _worker_loop(self) -> None:
-        while True:
-            item = self._queue.get()  # blocks until work arrives - no busy polling
-            if item is _SHUTDOWN:
-                return
-            self._run_job(item)
+        while (job_id := self._queue.consume()) is not None:  # blocks - no busy polling
+            self._run_job(job_id)
 
     def _run_job(self, job_id: str) -> None:
-        with self._lock:
-            job = self._jobs[job_id]
-            job.status = JobStatus.RUNNING
-            job.started_at = time.time()
+        self._store.update(
+            job_id, lambda job: replace(job, status=JobStatus.RUNNING, started_at=time.time())
+        )
+        job = self._get_job(job_id)
 
         try:
             counts = self._runner.run(job.qasm, job.num_shots)
         except Exception as exc:  # noqa: BLE001 - a bad job must not kill the worker
-            with self._lock:
-                job.status = JobStatus.ERROR
-                job.error = str(exc)
-                job.finished_at = time.time()
+            error_message = str(exc)
+            self._store.update(
+                job_id,
+                lambda j: replace(
+                    j, status=JobStatus.ERROR, error=error_message, finished_at=time.time()
+                ),
+            )
             return
 
-        with self._lock:
-            job.status = JobStatus.DONE
-            job.counts = counts
-            job.finished_at = time.time()
+        self._store.update(
+            job_id,
+            lambda j: replace(
+                j, status=JobStatus.DONE, counts=counts, finished_at=time.time()
+            ),
+        )

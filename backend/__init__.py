@@ -1,16 +1,22 @@
-from backend.sim_backend import (
-    Job,
+from backend.benchmark_engine import BenchmarkEngine
+from backend.errors import (
+    BenchmarkNotFoundError,
+    BenchmarkNotReadyError,
     JobNotFoundError,
     JobNotReadyError,
-    JobStatus,
-    SimBackend,
-    SimulatorRunner,
+    UnknownBackendError,
 )
-from backend.simulator_runners import (
+from backend.dal import InMemoryQueue, InMemoryStore, Queue, SqliteStore, Store
+from backend.models import BackendRun, Benchmark, BenchmarkStatus, Job, JobStatus
+from backend.runners import (
     NoisyDensityMatrixSimulatorRunner,
     NoisyStateVectorSimulatorRunner,
+    SimulatorRunner,
     StateVectorSimulatorRunner,
 )
+from backend.sim_backend import SimBackend
+from backend.synthesizers import ClassiqSynthesizer, Synthesizer
+from backend.system import build_system
 
 __all__ = [
     "Job",
@@ -22,4 +28,19 @@ __all__ = [
     "NoisyDensityMatrixSimulatorRunner",
     "NoisyStateVectorSimulatorRunner",
     "StateVectorSimulatorRunner",
+    "Benchmark",
+    "BackendRun",
+    "BenchmarkEngine",
+    "BenchmarkNotFoundError",
+    "BenchmarkNotReadyError",
+    "BenchmarkStatus",
+    "Synthesizer",
+    "ClassiqSynthesizer",
+    "UnknownBackendError",
+    "Store",
+    "InMemoryStore",
+    "SqliteStore",
+    "Queue",
+    "InMemoryQueue",
+    "build_system",
 ]

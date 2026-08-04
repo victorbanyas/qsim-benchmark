@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+# Without this, pytest's default import mode only puts tests/ on
+# sys.path (since it has no __init__.py tying it to a package root),
+# not the repo root - so `from backend...` fails when pytest is
+# invoked as the bare `pytest` command (it works under `python -m
+# pytest` only because `-m` happens to add the cwd itself). Adding the
+# repo root explicitly makes `backend` importable the same way
+# regardless of how pytest is invoked or from where.
+pythonpath = ["."]
