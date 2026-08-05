@@ -15,6 +15,10 @@ Run this once you've `pip install classiq`d:
 authenticate() below is safe to call on every run: if this device is
 already registered, it just refreshes the token silently (no browser
 prompt); it only opens one the very first time.
+
+Job records are persisted to classiq_model/benchmark_example.db via
+SqliteStore, rather than the in-memory default build_system() would
+otherwise use - so they survive past this process exiting.
 """
 
 import keyring
@@ -33,10 +37,13 @@ from classiq.qmod import qfunc
 # sibling directory) isn't importable without this
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from backend.dal import SqliteStore  # noqa: E402
 from backend.runners import StateVectorSimulatorRunner  # noqa: E402
 from backend.synthesizers import ClassiqSynthesizer  # noqa: E402
 from backend.system import build_system  # noqa: E402
 from backend.utils import wait_for_benchmark  # noqa: E402
+
+DB_PATH = Path(__file__).resolve().parent / "benchmark_example.db"
 
 
 @qfunc
@@ -67,7 +74,8 @@ def run_benchmark_example() -> None:
     expected_result = next(iter(counts))
     print(f"Expected bitstring: {expected_result!r}")
 
-    backends, engine = build_system()
+    job_store = SqliteStore(DB_PATH)
+    backends, engine = build_system(job_store=job_store)
     for backend in backends.values():
         backend.start()
     engine.start()
@@ -95,6 +103,7 @@ def run_benchmark_example() -> None:
         engine.stop(timeout=5.0)
         for backend in backends.values():
             backend.stop(timeout=5.0)
+        job_store.close()
 
 
 if __name__ == "__main__":
