@@ -104,7 +104,10 @@ cooperating services around one persistent datastore:
 - The **benchmarking engine** as another service: it consumes the
   benchmarks topic, synthesizes once, and fans out by publishing one message
   per backend onto each backend's own topic — it never talks to a backend
-  service directly, only through the shared table and the queues.
+  service directly, only through the shared table and the queues. In
+  practice this synthesize → fan-out → wait-for-all → aggregate flow, with
+  per-backend retry, is a natural fit for a workflow orchestrator like
+  Temporal rather than hand-rolled.
 - **Durability** falls out of this for free: because state lives in the DB
   and work lives in durably-committed queue offsets, a crashed or restarted
   worker just resumes — in-flight jobs are still sitting in the table
@@ -253,6 +256,12 @@ rather than leaving implicit:
   contention that a real database wouldn't have (row-level locking, or
   optimistic concurrency), but at this scale it isn't worth the added
   complexity of sharding locks per key.
+- **The queue isn't durable.** `InMemoryQueue` is just a `queue.Queue` in
+  process memory, so an id that's been published but not yet consumed is
+  lost if the process crashes — even with `SqliteStore` handling the
+  `Job`/`Benchmark` records durably underneath it. A real system would need
+  a persistent queue (e.g. Kafka/SQS) for in-flight work to survive a crash
+  the same way the store already does.
 
 ## 4. Testing
 
