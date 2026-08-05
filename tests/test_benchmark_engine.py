@@ -12,6 +12,7 @@ from backend.benchmark_engine import (
 )
 from backend.sim_backend import JobStatus, SimBackend
 from backend.dal import InMemoryStore
+from backend.utils import wait_for_benchmark
 
 
 class FakeRunner:
@@ -61,17 +62,6 @@ class DelayedSynthesizer:
         return self.qasm
 
 
-def _wait_until_finished(
-    engine: BenchmarkEngine, benchmark_id: str, timeout: float = 2.0
-) -> BenchmarkStatus:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        status = engine.get_benchmark_status(benchmark_id)
-        if status.is_finished:
-            return status
-        time.sleep(0.01)
-    raise TimeoutError(f"benchmark {benchmark_id} did not finish within {timeout}s")
-
 
 @pytest.fixture
 def make_engine():
@@ -120,7 +110,7 @@ def test_benchmark_scores_all_backends(make_engine):
     )
 
     bid = engine.benchmark(qmod="QMOD", expected_result="11", backends=["b1", "b2"], num_shots=100)
-    status = _wait_until_finished(engine, bid)
+    status = wait_for_benchmark(engine, bid, timeout=2.0)
 
     assert status.synthesis_status == JobStatus.DONE
     assert status.backend_statuses == {"b1": JobStatus.DONE, "b2": JobStatus.DONE}
@@ -147,7 +137,7 @@ def test_partial_failure_does_not_block_other_backends(make_engine):
     )
 
     bid = engine.benchmark(qmod="QMOD", expected_result="11", backends=["good", "bad"], num_shots=100)
-    status = _wait_until_finished(engine, bid)
+    status = wait_for_benchmark(engine, bid, timeout=2.0)
 
     assert status.backend_statuses == {"good": JobStatus.DONE, "bad": JobStatus.ERROR}
     # The failing backend simply doesn't appear - it never produced a score.
@@ -160,7 +150,7 @@ def test_retry_backend_reuses_qasm_without_resynthesizing(make_engine):
     engine = make_engine({"flaky": flaky_runner}, synthesizer=synthesizer)
 
     bid = engine.benchmark(qmod="QMOD", expected_result="0", backends=["flaky"], num_shots=50)
-    _wait_until_finished(engine, bid)
+    wait_for_benchmark(engine, bid, timeout=2.0)
     assert engine.get_benchmark_status(bid).backend_statuses["flaky"] == JobStatus.ERROR
     assert len(synthesizer.calls) == 1
 
@@ -188,7 +178,7 @@ def test_synthesis_failure_is_reported_and_no_backends_run(make_engine):
     engine = make_engine({"b1": runner}, synthesizer=synthesizer)
 
     bid = engine.benchmark(qmod="BROKEN", expected_result="0", backends=["b1"], num_shots=10)
-    status = _wait_until_finished(engine, bid)
+    status = wait_for_benchmark(engine, bid, timeout=2.0)
 
     assert status.synthesis_status == JobStatus.ERROR
     assert status.backend_statuses == {}
@@ -233,7 +223,7 @@ def test_num_workers_processes_benchmarks_concurrently(make_engine):
         for i in range(3)
     ]
     for bid in ids:
-        _wait_until_finished(engine, bid)
+        wait_for_benchmark(engine, bid, timeout=2.0)
     elapsed = time.time() - started
 
     # Three 0.3s synthesis calls run one at a time would take ~0.9s; with 3

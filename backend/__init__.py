@@ -17,6 +17,7 @@ from backend.runners import (
 from backend.sim_backend import SimBackend
 from backend.synthesizers import ClassiqSynthesizer, Synthesizer
 from backend.system import build_system
+from backend.utils import wait_for_benchmark, wait_for_job
 
 __all__ = [
     "Job",
@@ -43,4 +44,6 @@ __all__ = [
     "Queue",
     "InMemoryQueue",
     "build_system",
+    "wait_for_job",
+    "wait_for_benchmark",
 ]

@@ -3,22 +3,17 @@ Model: x |= 3, y |= 5, z |= x + y - all three are deterministic (no
 superposition), so the synthesized circuit should produce a single expected
 outcome (x=3, y=5, z=8) on every shot in the noiseless case.
 
-Run this once, after installing and authenticating the Classiq SDK:
+Run this once you've `pip install classiq`d:
 
-    pip install classiq
-    python -c "from classiq import authenticate; authenticate()"
     python classiq_model/arithmetic_example.py
 
-It synthesizes the model, exports OpenQASM 2.0, writes it to
-tests/resources/arithmetic.qasm (overwriting the Qiskit-adder placeholder
-used there today), and prints the bitstring you should paste into
-EXPECTED_BITSTRING in tests/test_arithmetic_end_to_end.py.
+authenticate() below is safe to call on every run: if this device is
+already registered, it just refreshes the token silently (no browser
+prompt); it only opens one the very first time.
 
-Why a placeholder exists at all: producing this file requires a live,
-authenticated call to Classiq's cloud synthesis service. That's not
-something that can be done from an offline/sandboxed environment - hence
-the interim Qiskit-only circuit already committed, which exercises the same
-SimBackend / SimulatorRunner pipeline this file's output will run through.
+It synthesizes the model, exports OpenQASM 2.0, writes it to
+tests/resources/arithmetic.qasm, and prints the bitstring to paste into
+EXPECTED_BITSTRING in tests/test_arithmetic_end_to_end.py.
 """
 
 import sys
@@ -72,5 +67,5 @@ def synthesize_arithmetic_model() -> None:
 
 
 if __name__ == "__main__":
-    authenticate(overwrite=True)  # only needed if you haven't already authenticated
+    authenticate()
     synthesize_arithmetic_model()

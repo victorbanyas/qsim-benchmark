@@ -34,27 +34,18 @@ from backend.runners import (
     NoisyStateVectorSimulatorRunner,
     StateVectorSimulatorRunner,
 )
+from backend.utils import wait_for_job
 
 QASM_PATH = Path(__file__).parent / "resources" / "arithmetic.qasm"
 EXPECTED_BITSTRING = "100010111"  # z=1000(8), y=101(5), x=11(3)  ->  3 + 5 = 8
 NUM_SHOTS = 2000
 
 
-def _wait_until_finished(backend: SimBackend, job_id: str, timeout: float = 30.0) -> JobStatus:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        status = backend.get_status(job_id)
-        if status in (JobStatus.DONE, JobStatus.ERROR):
-            return status
-        time.sleep(0.02)
-    raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
-
-
 def _run_on_backend(backend: SimBackend, qasm: str) -> Dict[str, int]:
     backend.start()
     try:
         job_id = backend.submit_job(qasm, num_shots=NUM_SHOTS)
-        status = _wait_until_finished(backend, job_id)
+        status = wait_for_job(backend, job_id, timeout=30.0, poll_interval=0.02)
         assert status == JobStatus.DONE, f"{backend.name} job ended in {status}"
         return backend.get_result(job_id)
     finally:

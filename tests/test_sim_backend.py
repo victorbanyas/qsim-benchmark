@@ -9,6 +9,7 @@ from backend.sim_backend import (
     JobStatus,
     SimBackend,
 )
+from backend.utils import wait_for_job
 
 
 class FakeRunner:
@@ -27,16 +28,6 @@ class FakeRunner:
         if self.exc:
             raise self.exc
         return self.counts
-
-
-def _wait_until_finished(backend, job_id, timeout=2.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        status = backend.get_status(job_id)
-        if status in (JobStatus.DONE, JobStatus.ERROR):
-            return status
-        time.sleep(0.01)
-    raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
 
 
 @pytest.fixture
@@ -64,7 +55,7 @@ def test_submit_job_runs_and_returns_counts(running_backend):
     backend = running_backend(FakeRunner(counts={"00": 512, "11": 488}))
 
     job_id = backend.submit_job("OPENQASM 2.0; ...", num_shots=1000)
-    _wait_until_finished(backend, job_id)
+    wait_for_job(backend, job_id, timeout=2.0)
 
     assert backend.get_status(job_id) == JobStatus.DONE
     assert backend.get_result(job_id) == {"00": 512, "11": 488}
@@ -93,7 +84,7 @@ def test_failed_job_reports_error_without_killing_worker(running_backend):
     backend = running_backend(runner)
 
     failing_job = backend.submit_job("qasm", num_shots=100)
-    _wait_until_finished(backend, failing_job)
+    wait_for_job(backend, failing_job, timeout=2.0)
 
     assert backend.get_status(failing_job) == JobStatus.ERROR
     with pytest.raises(RuntimeError):
@@ -102,7 +93,7 @@ def test_failed_job_reports_error_without_killing_worker(running_backend):
     # The worker thread must survive a failed job and keep processing new ones.
     runner.exc = None
     ok_job = backend.submit_job("qasm", num_shots=100)
-    _wait_until_finished(backend, ok_job)
+    wait_for_job(backend, ok_job, timeout=2.0)
 
     assert backend.get_status(ok_job) == JobStatus.DONE
     assert backend.get_result(ok_job) == {"00": 100}
@@ -114,7 +105,7 @@ def test_jobs_on_one_backend_run_serially(running_backend):
 
     ids = [backend.submit_job("qasm", num_shots=10) for _ in range(3)]
     for job_id in ids:
-        _wait_until_finished(backend, job_id)
+        wait_for_job(backend, job_id, timeout=2.0)
 
     assert len(runner.calls) == 3
     assert all(backend.get_status(j) == JobStatus.DONE for j in ids)
@@ -124,5 +115,5 @@ def test_start_is_idempotent(running_backend):
     backend = running_backend(FakeRunner())
     backend.start()  # second call should be a no-op, not a second thread
     job_id = backend.submit_job("qasm", num_shots=10)
-    _wait_until_finished(backend, job_id)
+    wait_for_job(backend, job_id, timeout=2.0)
     assert backend.get_status(job_id) == JobStatus.DONE

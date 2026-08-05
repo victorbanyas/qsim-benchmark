@@ -28,6 +28,7 @@ from backend.runners import (
     StateVectorSimulatorRunner,
 )
 from backend.dal import InMemoryStore
+from backend.utils import wait_for_benchmark
 
 QASM_PATH = Path(__file__).parent / "resources" / "arithmetic.qasm"
 EXPECTED_BITSTRING = "100010111"  # z=1000(8), y=101(5), x=11(3)  ->  3 + 5 = 8
@@ -43,18 +44,6 @@ class _FixtureSynthesizer:
 
     def synthesize(self, qmod: str) -> str:
         return self._qasm
-
-
-def _wait_until_finished(
-    engine: BenchmarkEngine, benchmark_id: str, timeout: float = 30.0
-) -> BenchmarkStatus:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        status = engine.get_benchmark_status(benchmark_id)
-        if status.is_finished:
-            return status
-        time.sleep(0.02)
-    raise TimeoutError(f"benchmark {benchmark_id} did not finish within {timeout}s")
 
 
 @pytest.fixture
@@ -94,7 +83,7 @@ def test_arithmetic_benchmark_across_all_three_backends(engine):
         num_shots=NUM_SHOTS,
     )
 
-    status = _wait_until_finished(engine, benchmark_id)
+    status = wait_for_benchmark(engine, benchmark_id, timeout=30.0, poll_interval=0.02)
 
     # Synthesis and every backend job must have completed cleanly - nothing
     # in this run is expected to fail.

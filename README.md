@@ -322,6 +322,13 @@ single outcome on every noise-free shot.
   the identical committed circuit — the benchmark engine is really just
   orchestrating the same three backend runs plus one synthesis step.
 
+### 4.3 Live example
+
+`classiq_model/benchmark_example.py` is a runnable example, not a test: run
+it with `python classiq_model/benchmark_example.py` and it prints scores to
+stdout. Unlike the tests above, it synthesizes its model against Classiq's
+cloud service on every run rather than using a pre-synthesized QASM fixture.
+
 ## 5. Notes
 
 **Why the test suite runs against a committed QASM fixture instead of

@@ -13,6 +13,7 @@ from typing import Dict
 from backend.sim_backend import JobStatus, SimulatorRunner
 from backend.dal import InMemoryStore
 from backend.system import build_system
+from backend.utils import wait_for_benchmark
 
 
 class FakeRunner:
@@ -33,16 +34,6 @@ class FakeSynthesizer:
         return self.qasm
 
 
-def _wait_until_finished(engine, benchmark_id, timeout: float = 2.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        status = engine.get_benchmark_status(benchmark_id)
-        if status.is_finished:
-            return status
-        time.sleep(0.01)
-    raise TimeoutError(f"benchmark {benchmark_id} did not finish within {timeout}s")
-
-
 def test_build_system_wires_a_shared_job_store_end_to_end():
     runners: Dict[str, SimulatorRunner] = {
         "b1": FakeRunner(counts={"11": 90, "00": 10}),
@@ -57,7 +48,7 @@ def test_build_system_wires_a_shared_job_store_end_to_end():
         bid = engine.benchmark(
             qmod="QMOD", expected_result="11", backends=["b1", "b2"], num_shots=100
         )
-        status = _wait_until_finished(engine, bid)
+        status = wait_for_benchmark(engine, bid, timeout=2.0)
 
         assert status.synthesis_status == JobStatus.DONE
         assert status.backend_statuses == {"b1": JobStatus.DONE, "b2": JobStatus.DONE}
