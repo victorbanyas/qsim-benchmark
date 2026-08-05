@@ -100,7 +100,10 @@ cooperating services around one persistent datastore:
 - Each simulated backend as its **own worker service** (or pool of workers
   in a consumer group) consuming its topic, executing one job at a time (or
   in parallel across workers), and writing every status transition straight
-  back to the jobs table.
+  back to the jobs table. Being its own service, each backend would have its
+  own external API layer too — `submit_job()` / `get_status()` /
+  `get_result()` are that method surface, the same relationship
+  `benchmark()` has to the engine below.
 - The **benchmarking engine** as another service: it consumes the
   benchmarks topic, synthesizes once, and fans out by publishing one message
   per backend onto each backend's own topic — it never talks to a backend
@@ -108,6 +111,12 @@ cooperating services around one persistent datastore:
   practice this synthesize → fan-out → wait-for-all → aggregate flow, with
   per-backend retry, is a natural fit for a workflow orchestrator like
   Temporal rather than hand-rolled.
+- An **external API layer** (REST or gRPC) would sit in front of the
+  benchmarking engine so outside clients could submit qmods and poll status
+  without touching any internal service directly. `benchmark()` /
+  `get_benchmark_status()` / `get_benchmark_result()` are already that
+  method surface — `classiq_model/benchmark_example.py` calls them
+  in-process, standing in for what a real client would do over the network.
 - **Durability** falls out of this for free: because state lives in the DB
   and work lives in durably-committed queue offsets, a crashed or restarted
   worker just resumes — in-flight jobs are still sitting in the table
